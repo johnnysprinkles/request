@@ -1,22 +1,30 @@
 
 # Request - Simplified HTTP client
 
-[![npm package](https://nodei.co/npm/request.png?downloads=true&downloadRank=true&stars=true)](https://nodei.co/npm/request/)
+This is a fork of the excellent `request` module, which is used inside Postman Runtime. It contains a few bugfixes that are not fixed in `request`:
 
-[![Build status](https://img.shields.io/travis/request/request/master.svg?style=flat-square)](https://travis-ci.org/request/request)
-[![Coverage](https://img.shields.io/codecov/c/github/request/request.svg?style=flat-square)](https://codecov.io/github/request/request?branch=master)
-[![Coverage](https://img.shields.io/coveralls/request/request.svg?style=flat-square)](https://coveralls.io/r/request/request)
-[![Dependency Status](https://img.shields.io/david/request/request.svg?style=flat-square)](https://david-dm.org/request/request)
-[![Known Vulnerabilities](https://snyk.io/test/npm/request/badge.svg?style=flat-square)](https://snyk.io/test/npm/request)
-[![Gitter](https://img.shields.io/badge/gitter-join_chat-blue.svg?style=flat-square)](https://gitter.im/request/request?utm_source=badge)
-
+- Handling of old-style deflate responses: https://github.com/request/request/issues/2197
+- Correct encoding of URL Parameters: https://github.com/nodejs/node/issues/8321
+- Redirect behavior for 307 responses when Host header is set: https://github.com/request/request/issues/2666
+- Fix missing `content-length` header for streaming requests: https://github.com/request/request/issues/316
+- Exception handling for large form-data: https://github.com/request/request/issues/1561
+- Added feature to bind on stream emits via options
+- Allowed sending request body with HEAD method
+- Added option to retain `authorization` header when a redirect happens to a different hostname
+- Reinitialize FormData stream on 307 or 308 redirects
+- Respect form-data fields ordering
+- Fixed authentication leak in 307 and 308 redirects
+- Added `secureConnect` to timings and `secureHandshake` to timingPhases
+- Fixed `Request~getNewAgent` to account for `passphrase` while generating poolKey
+- Added support for extending the root CA certificates
+- Added `verbose` mode to bubble up low-level request-response information
 
 ## Super simple to use
 
 Request is designed to be the simplest way possible to make http calls. It supports HTTPS and follows redirects by default.
 
 ```js
-var request = require('request');
+const request = require('postman-request');
 request('http://www.google.com', function (error, response, body) {
   console.log('error:', error); // Print the error if one occurred
   console.log('statusCode:', response && response.statusCode); // Print the response status code if a response was received
@@ -110,7 +118,7 @@ You can also `pipe()` from `http.ServerRequest` instances, as well as to `http.S
 ```js
 http.createServer(function (req, resp) {
   if (req.url === '/doodle.png') {
-    var x = request('http://mysite.com/doodle.png')
+    const x = request('http://mysite.com/doodle.png')
     req.pipe(x)
     x.pipe(resp)
   }
@@ -126,7 +134,7 @@ req.pipe(request('http://mysite.com/doodle.png')).pipe(resp)
 Also, none of this new functionality conflicts with requests previous features, it just expands them.
 
 ```js
-var r = request.defaults({'proxy':'http://localproxy.com'})
+const r = request.defaults({'proxy':'http://localproxy.com'})
 
 http.createServer(function (req, resp) {
   if (req.url === '/doodle.png') {
@@ -151,6 +159,8 @@ Several alternative interfaces are provided by the request team, including:
 - [`request-promise`](https://github.com/request/request-promise) (uses [Bluebird](https://github.com/petkaantonov/bluebird) Promises)
 - [`request-promise-native`](https://github.com/request/request-promise-native) (uses native Promises)
 - [`request-promise-any`](https://github.com/request/request-promise-any) (uses [any-promise](https://www.npmjs.com/package/any-promise) Promises)
+
+Also, [`util.promisify`](https://nodejs.org/api/util.html#util_util_promisify_original), which is available from Node.js v8.0 can be used to convert a regular function that takes a callback to return a promise instead.
 
 
 [back to top](#table-of-contents)
@@ -183,11 +193,11 @@ For `multipart/form-data` we use the [form-data](https://github.com/form-data/fo
 
 
 ```js
-var formData = {
+const formData = {
   // Pass a simple key-value pair
   my_field: 'my_value',
   // Pass data via Buffers
-  my_buffer: new Buffer([1, 2, 3]),
+  my_buffer: Buffer.from([1, 2, 3]),
   // Pass data via Streams
   my_file: fs.createReadStream(__dirname + '/unicycle.jpg'),
   // Pass multiple values /w an Array
@@ -218,10 +228,10 @@ For advanced cases, you can access the form-data object itself via `r.form()`. T
 
 ```js
 // NOTE: Advanced use-case, for normal use see 'formData' usage above
-var r = request.post('http://service.com/upload', function optionalCallback(err, httpResponse, body) {...})
-var form = r.form();
+const r = request.post('http://service.com/upload', function optionalCallback(err, httpResponse, body) {...})
+const form = r.form();
 form.append('my_field', 'my_value');
-form.append('my_buffer', new Buffer([1, 2, 3]));
+form.append('my_buffer', Buffer.from([1, 2, 3]));
 form.append('custom_file', fs.createReadStream(__dirname + '/unicycle.jpg'), {filename: 'unicycle.jpg'});
 ```
 See the [form-data README](https://github.com/form-data/form-data) for more information & examples.
@@ -314,11 +324,11 @@ detailed in [RFC 1738](http://www.ietf.org/rfc/rfc1738.txt). Simply pass the
 `user:password` before the host with an `@` sign:
 
 ```js
-var username = 'username',
+const username = 'username',
     password = 'password',
     url = 'http://' + username + ':' + password + '@some.server.com';
 
-request({url: url}, function (error, response, body) {
+request({url}, function (error, response, body) {
    // Do more stuff with 'body' here
 });
 ```
@@ -347,24 +357,39 @@ of stars and forks for the request repository. This requires a
 custom `User-Agent` header as well as https.
 
 ```js
-var request = require('request');
+const request = require('postman-request');
 
-var options = {
+const options = {
   url: 'https://api.github.com/repos/request/request',
   headers: {
-    'User-Agent': 'request'
+    'User-Agent': 'postman-request'
   }
 };
 
 function callback(error, response, body) {
   if (!error && response.statusCode == 200) {
-    var info = JSON.parse(body);
+    const info = JSON.parse(body);
     console.log(info.stargazers_count + " Stars");
     console.log(info.forks_count + " Forks");
   }
 }
 
 request(options, callback);
+```
+
+### Blacklisting headers
+
+Use `options.blacklistHeaders` option to blacklist the list of headers from requests and redirects.
+
+```js
+var options = {
+  setHost: false, // set false to disable addition of `Host` header
+  blacklistHeaders: ['connection', 'content-length', 'transfer-encoding']
+}
+
+request.post('http://localhost:3000', options, function(err, res, body) {
+    // "POST / HTTP/1.1\r\n\r\n"
+});
 ```
 
 [back to top](#table-of-contents)
@@ -382,7 +407,7 @@ default signing algorithm is
 ```js
 // OAuth1.0 - 3-legged server side flow (Twitter example)
 // step 1
-var qs = require('querystring')
+const qs = require('querystring')
   , oauth =
     { callback: 'http://mysite.com/callback/'
     , consumer_key: CONSUMER_KEY
@@ -397,14 +422,14 @@ request.post({url:url, oauth:oauth}, function (e, r, body) {
   // verified with twitter that they are authorizing your app.
 
   // step 2
-  var req_data = qs.parse(body)
-  var uri = 'https://api.twitter.com/oauth/authenticate'
+  const req_data = qs.parse(body)
+  const uri = 'https://api.twitter.com/oauth/authenticate'
     + '?' + qs.stringify({oauth_token: req_data.oauth_token})
   // redirect the user to the authorize uri
 
   // step 3
   // after the user is redirected back to your server
-  var auth_data = qs.parse(body)
+  const auth_data = qs.parse(body)
     , oauth =
       { consumer_key: CONSUMER_KEY
       , consumer_secret: CONSUMER_SECRET
@@ -416,7 +441,7 @@ request.post({url:url, oauth:oauth}, function (e, r, body) {
     ;
   request.post({url:url, oauth:oauth}, function (e, r, body) {
     // ready to make signed requests on behalf of the user
-    var perm_data = qs.parse(body)
+    const perm_data = qs.parse(body)
       , oauth =
         { consumer_key: CONSUMER_KEY
         , consumer_secret: CONSUMER_SECRET
@@ -605,14 +630,14 @@ TLS/SSL Protocol options, such as `cert`, `key` and `passphrase`, can be
 set directly in `options` object, in the `agentOptions` property of the `options` object, or even in `https.globalAgent.options`. Keep in mind that, although `agentOptions` allows for a slightly wider range of configurations, the recommended way is via `options` object directly, as using `agentOptions` or `https.globalAgent.options` would not be applied in the same way in proxied environments (as data travels through a TLS connection instead of an http/https agent).
 
 ```js
-var fs = require('fs')
+const fs = require('fs')
     , path = require('path')
     , certFile = path.resolve(__dirname, 'ssl/client.crt')
     , keyFile = path.resolve(__dirname, 'ssl/client.key')
     , caFile = path.resolve(__dirname, 'ssl/ca.cert.pem')
-    , request = require('request');
+    , request = require('postman-request');
 
-var options = {
+const options = {
     url: 'https://api.some-server.com/',
     cert: fs.readFileSync(certFile),
     key: fs.readFileSync(keyFile),
@@ -629,13 +654,13 @@ In the example below, we call an API that requires client side SSL certificate
 (in PEM format) with passphrase protected private key (in PEM format) and disable the SSLv3 protocol:
 
 ```js
-var fs = require('fs')
+const fs = require('fs')
     , path = require('path')
     , certFile = path.resolve(__dirname, 'ssl/client.crt')
     , keyFile = path.resolve(__dirname, 'ssl/client.key')
-    , request = require('request');
+    , request = require('postman-request');
 
-var options = {
+const options = {
     url: 'https://api.some-server.com/',
     agentOptions: {
         cert: fs.readFileSync(certFile),
@@ -675,6 +700,134 @@ request.get({
 });
 ```
 
+The `ca` value can be an array of certificates, in the event you have a private or internal corporate public-key infrastructure hierarchy. For example, if you want to connect to https://api.some-server.com which presents a key chain consisting of:
+1. its own public key, which is signed by:
+2. an intermediate "Corp Issuing Server", that is in turn signed by:
+3. a root CA "Corp Root CA";
+
+you can configure your request as follows:
+
+```js
+request.get({
+    url: 'https://api.some-server.com/',
+    agentOptions: {
+        ca: [
+          fs.readFileSync('Corp Issuing Server.pem'),
+          fs.readFileSync('Corp Root CA.pem')
+        ]
+    }
+});
+```
+
+### Using `options.verbose`
+
+Using this option the debug object holds low level request response information like remote address, negotiated ciphers etc. Example debug object:
+
+```js
+request({url: 'https://www.google.com', verbose: true}, function (error, response, body, debug) {
+  // debug:
+  /*
+  [
+    {
+      "request": {
+        "method": "GET",
+        "href": "https://www.google.com/",
+        "httpVersion": "1.1"
+      },
+      "session": {
+        "id": "9a1ac0d7-b757-48ad-861c-d59d6af5f43f",
+        "reused": false,
+        "data": {
+          "addresses": {
+            "local": {
+              "address": "8.8.4.4",
+              "family": "IPv4",
+              "port": 61632
+            },
+            "remote": {
+              "address": "172.217.31.196",
+              "family": "IPv4",
+              "port": 443
+            }
+          },
+          "tls": {
+            "reused": false,
+            "authorized": true,
+            "authorizationError": null,
+            "cipher": {
+              "name": "ECDHE-ECDSA-AES128-GCM-SHA256",
+              "version": "TLSv1/SSLv3"
+            },
+            "protocol": "TLSv1.2",
+            "ephemeralKeyInfo": {
+              "type": "ECDH",
+              "name": "X25519",
+              "size": 253
+            },
+            "peerCertificate": {
+              "subject": {
+                "country": "US",
+                "stateOrProvince": "California",
+                "locality": "Mountain View",
+                "organization": "Google LLC",
+                "commonName": "www.google.com",
+                "alternativeNames": "DNS:www.google.com"
+              },
+              "issuer": {
+                "country": "US",
+                "organization": "Google Trust Services",
+                "commonName": "Google Internet Authority G3"
+              },
+              "validFrom": "2019-03-01T09:46:35.000Z",
+              "validTo": "2019-05-24T09:25:00.000Z",
+              "fingerprint": "DF:6B:95:81:C6:03:EB:ED:48:EB:6C:CF:EE:FE:E6:1F:AD:01:78:34",
+              "serialNumber": "3A15F4C87FB4D33993D3EEB3BF4AE5E4"
+            }
+          }
+        }
+      },
+      "response": {
+        "statusCode": 200,
+        "httpVersion": "1.1"
+      },
+      "timingStart": 1552908287924,
+      "timingStartTimer": 805.690674,
+      "timings": {
+        "socket": 28.356426000000056,
+        "lookup": 210.3752320000001,
+        "connect": 224.57993499999998,
+        "secureConnect": 292.80315800000017,
+        "response": 380.61268100000007,
+        "end": 401.8332560000001
+      }
+    }
+  ]
+  */
+});
+```
+
+
+### Extending root CAs
+
+When this feature is enabled, the root CAs can be extended using the `extraCA` option. The file should consist of one or more trusted certificates in PEM format.
+
+This is similar to [NODE_EXTRA_CA_CERTS](https://nodejs.org/api/cli.html#cli_node_extra_ca_certs_file). But, if `options.ca` is specified, those will be extended as well.
+
+```js
+// enable extending CAs
+request.enableNodeExtraCACerts();
+
+// request with extra CA certs
+request.get({
+    url: 'https://api.some-server.com/',
+    extraCA: fs.readFileSync('Extra CA Certificates .pem')
+});
+
+// disable this feature
+request.disableNodeExtraCACerts()
+
+```
+
 [back to top](#table-of-contents)
 
 
@@ -687,7 +840,7 @@ The `options.har` property will override the values: `url`, `method`, `qs`, `hea
 A validation step will check if the HAR Request format matches the latest spec (v1.2) and will skip parsing if not matching.
 
 ```js
-  var request = require('request')
+  const request = require('postman-request')
   request({
     // will be ignored
     method: 'GET',
@@ -772,7 +925,7 @@ The first argument can be either a `url` or an `options` object. The only requir
 - `auth` - a hash containing values `user` || `username`, `pass` || `password`, and `sendImmediately` (optional). See documentation above.
 - `oauth` - options for OAuth HMAC-SHA1 signing. See documentation above.
 - `hawk` - options for [Hawk signing](https://github.com/hueniverse/hawk). The `credentials` key must contain the necessary signing info, [see hawk docs for details](https://github.com/hueniverse/hawk#usage-example).
-- `aws` - `object` containing AWS signing information. Should have the properties `key`, `secret`, and optionally `session` (note that this only works for services that require session as part of the canonical string). Also requires the property `bucket`, unless you’re specifying your `bucket` as part of the path, or the request doesn’t use a bucket (i.e. GET Services). If you want to use AWS sign version 4 use the parameter `sign_version` with value `4` otherwise the default is version 2. **Note:** you need to `npm install aws4` first.
+- `aws` - `object` containing AWS signing information. Should have the properties `key`, `secret`, and optionally `session` (note that this only works for services that require session as part of the canonical string). Also requires the property `bucket`, unless you’re specifying your `bucket` as part of the path, or the request doesn’t use a bucket (i.e. GET Services). If you want to use AWS sign version 4 use the parameter `sign_version` with value `4` otherwise the default is version 2. If you are using SigV4, you can also include a `service` property that specifies the service name. **Note:** you need to `npm install aws4` first.
 - `httpSignature` - options for the [HTTP Signature Scheme](https://github.com/joyent/node-http-signature/blob/master/http_signing.md) using [Joyent's library](https://github.com/joyent/node-http-signature). The `keyId` and `key` properties must be specified. See the docs for other options.
 
 ---
@@ -780,13 +933,16 @@ The first argument can be either a `url` or an `options` object. The only requir
 - `followRedirect` - follow HTTP 3xx responses as redirects (default: `true`). This property can also be implemented as function which gets `response` object as a single argument and should return `true` if redirects should continue or `false` otherwise.
 - `followAllRedirects` - follow non-GET HTTP 3xx responses as redirects (default: `false`)
 - `followOriginalHttpMethod` - by default we redirect to HTTP method GET. you can enable this property to redirect to the original HTTP method (default: `false`)
+- `followAuthorizationHeader` - retain `authorization` header when a redirect happens to a different hostname (default: `false`)
 - `maxRedirects` - the maximum number of redirects to follow (default: `10`)
 - `removeRefererHeader` - removes the referer header when a redirect happens (default: `false`). **Note:** if true, referer header set in the initial request is preserved during redirect chain.
 
 ---
 
 - `encoding` - encoding to be used on `setEncoding` of response data. If `null`, the `body` is returned as a `Buffer`. Anything else **(including the default value of `undefined`)** will be passed as the [encoding](http://nodejs.org/api/buffer.html#buffer_buffer) parameter to `toString()` (meaning this is effectively `utf8` by default). (**Note:** if you expect binary data, you should set `encoding: null`.)
+- `statusMessageEncoding` - if provided, this will be passed as the [encoding](http://nodejs.org/api/buffer.html#buffer_buffer) parameter to `toString()` to convert the status message buffer. Otherwise, status message will returned as a string with encoding type `latin1`. Providing a value in this option will result in force re-encoding of the status message which may not always be intended by the server - specifically in cases where  server returns a status message which when encoded again with a different character encoding results in some other characters. For example: If the server intentionally responds with `ð\x9F\x98\x8A` as status message but if the statusMessageEncoding option is set to `utf8`, then it would get converted to '😊'.
 - `gzip` - if `true`, add an `Accept-Encoding` header to request compressed content encodings from the server (if not already present) and decode supported content encodings in the response. **Note:** Automatic decoding of the response content is performed on the body data returned through `request` (both through the `request` stream and passed to the callback function) but is not performed on the `response` stream (available from the `response` event) which is the unmodified `http.IncomingMessage` object which may contain compressed data. See example below.
+- `brotli` - if `true`, add an `Accept-Encoding` header to request Brotli compressed content encodings from the server (if not already present).
 - `jar` - if `true`, remember cookies for future use (or define your custom cookie jar; see examples section)
 
 ---
@@ -794,6 +950,18 @@ The first argument can be either a `url` or an `options` object. The only requir
 - `agent` - `http(s).Agent` instance to use
 - `agentClass` - alternatively specify your agent's class name
 - `agentOptions` - and pass its options. **Note:** for HTTPS see [tls API doc for TLS/SSL options](http://nodejs.org/api/tls.html#tls_tls_connect_options_callback) and the [documentation above](#using-optionsagentoptions).
+- `agents` - Specify separate agent instances for HTTP and HTTPS requests. Required in case of HTTP to HTTPS redirects and vice versa. For example:
+```js
+request.defaults({
+  agents: {
+    http: new http.Agent(),
+    https: {
+      agentClass: https.Agent,
+      agentOptions: { keepAlive: true }
+    }
+  }
+})
+```
 - `forever` - set to `true` to use the [forever-agent](https://github.com/request/forever-agent) **Note:** Defaults to `http(s).Agent({keepAlive:true})` in node 0.12+
 - `pool` - an object describing which agents to use for the request. If this option is omitted the request will use the global agent (as long as your options allow for it). Otherwise, request will search the pool for your custom agent. If no custom agent is found, a new agent will be created and added to the pool. **Note:** `pool` is used only when the `agent` option is not specified.
   - A `maxSockets` property can also be provided on the `pool` object to set the max number of sockets for all agents created (ex: `pool: {maxSockets: Infinity}`).
@@ -802,14 +970,16 @@ The first argument can be either a `url` or an `options` object. The only requir
     work around this, either use [`request.defaults`](#requestdefaultsoptions)
     with your pool options or create the pool object with the `maxSockets`
     property outside of the loop.
-- `timeout` - integer containing the number of milliseconds to wait for a
-server to send response headers (and start the response body) before aborting
-the request. Note that if the underlying TCP connection cannot be established,
-the OS-wide TCP connection timeout will overrule the `timeout` option ([the
-default in Linux can be anywhere from 20-120 seconds][linux-timeout]).
+- `timeout` - integer containing number of milliseconds, controls two timeouts
+  - Time to wait for a server to send response headers (and start the response body) before aborting the request.
+    Note that if the underlying TCP connection cannot be established,
+    the OS-wide TCP connection timeout will overrule the `timeout` option ([the
+    default in Linux can be anywhere from 20-120 seconds][linux-timeout]).
+  - Sets the socket to timeout after `timeout` milliseconds of inactivity on the socket.
 
 [linux-timeout]: http://www.sekuda.com/overriding_the_default_linux_kernel_20_second_tcp_socket_connect_timeout
 
+- `maxResponseSize` - Abort request if the response size exceeds this threshold (bytes).
 ---
 
 - `localAddress` - local interface to bind for network connections.
@@ -829,6 +999,8 @@ default in Linux can be anywhere from 20-120 seconds][linux-timeout]).
 
 ---
 
+- `disableUrlEncoding` - if `true`, it will not use postman-url-encoder to encode URL. It means that if URL is given as object, it will be used as it is without doing any encoding. But if URL is given as string, it will be encoded by Node while converting it to object.
+- `urlParser` - it takes an object with two functions `parse` and `resolve` in it. The `parse` function is used to parse the URL string into URL object and the `resolve` function is used to resolve relative URLs with respect to base URL. If this option is not provided or it is provided but does not contain both (`parse` and `resolve`) methods, it will default to Node's `url.parse()` and `url.resolve()` methods.
 - `time` - if `true`, the request-response cycle (including all redirects) is timed at millisecond resolution. When set, the following properties are added to the response object:
   - `elapsedTime` Duration of the entire request/response in milliseconds (*deprecated*).
   - `responseStartTime` Timestamp when the response began (in Unix Epoch milliseconds) (*deprecated*).
@@ -837,17 +1009,19 @@ default in Linux can be anywhere from 20-120 seconds][linux-timeout]).
     - `socket` Relative timestamp when the [`http`](https://nodejs.org/api/http.html#http_event_socket) module's `socket` event fires. This happens when the socket is assigned to the request.
     - `lookup` Relative timestamp when the [`net`](https://nodejs.org/api/net.html#net_event_lookup) module's `lookup` event fires. This happens when the DNS has been resolved.
     - `connect`: Relative timestamp when the [`net`](https://nodejs.org/api/net.html#net_event_connect) module's `connect` event fires. This happens when the server acknowledges the TCP connection.
+    - `secureConnect`: Relative timestamp when the [`tls`](https://nodejs.org/api/tls.html#tls_event_secureconnect) module's `secureconnect` event fires. This happens when the handshaking process for a new connection has successfully completed.
     - `response`: Relative timestamp when the [`http`](https://nodejs.org/api/http.html#http_event_response) module's `response` event fires. This happens when the first bytes are received from the server.
     - `end`: Relative timestamp when the last bytes of the response are received.
   - `timingPhases` Contains the durations of each request phase. If there were redirects, the properties reflect the timings of the final request in the redirect chain:
     - `wait`: Duration of socket initialization (`timings.socket`)
     - `dns`: Duration of DNS lookup (`timings.lookup` - `timings.socket`)
-    - `tcp`: Duration of TCP connection (`timings.connect` - `timings.socket`)
-    - `firstByte`: Duration of HTTP server response (`timings.response` - `timings.connect`)
+    - `tcp`: Duration of TCP connection (`timings.connect` - `timings.lookup`)
+    - `secureHandshake`: Duration of SSL handshake (`timings.secureConnect` - `timings.connect`)
+    - `firstByte`: Duration of HTTP server response (`timings.response` - `timings.connect`|`timings.secureConnect`)
     - `download`: Duration of HTTP download (`timings.end` - `timings.response`)
     - `total`: Duration entire HTTP round-trip (`timings.end`)
 
-- `har` - a [HAR 1.2 Request Object](http://www.softwareishard.com/blog/har-12-spec/#request), will be processed from HAR format into options overwriting matching values *(see the [HAR 1.2 section](#support-for-har-1.2) for details)*
+- `har` - a [HAR 1.2 Request Object](http://www.softwareishard.com/blog/har-12-spec/#request), will be processed from HAR format into options overwriting matching values *(see the [HAR 1.2 section](#support-for-har-12) for details)*
 - `callback` - alternatively pass the request's callback in the options object
 
 The callback argument gets 3 arguments:
@@ -880,13 +1054,13 @@ instead, it **returns a wrapper** that has your default settings applied to it.
 For example:
 ```js
 //requests using baseRequest() will set the 'x-token' header
-var baseRequest = request.defaults({
+const baseRequest = request.defaults({
   headers: {'x-token': 'my-token'}
 })
 
 //requests using specialRequest() will include the 'x-token' header set in
 //baseRequest and will also include the 'special' header
-var specialRequest = baseRequest.defaults({
+const specialRequest = baseRequest.defaults({
   headers: {special: 'special value'}
 })
 ```
@@ -918,6 +1092,17 @@ Function that creates a new cookie jar.
 request.jar()
 ```
 
+### response.caseless.get('header-name')
+
+Function that returns the specified response header field using a [case-insensitive match](https://tools.ietf.org/html/rfc7230#section-3.2)
+
+```js
+request('http://www.google.com', function (error, response, body) {
+  // print the Content-Type header even if the server returned it as 'content-type' (lowercase)
+  console.log('Content-Type is:', response.caseless.get('Content-Type'));
+});
+```
+
 [back to top](#table-of-contents)
 
 
@@ -931,7 +1116,7 @@ There are at least three ways to debug the operation of `request`:
 1. Launch the node process like `NODE_DEBUG=request node script.js`
    (`lib,request,otherlib` works too).
 
-2. Set `require('request').debug = true` at any time (this does the same thing
+2. Set `require('postman-request').debug = true` at any time (this does the same thing
    as #1).
 
 3. Use the [request-debug module](https://github.com/request/request-debug) to
@@ -975,7 +1160,7 @@ request.get('http://10.255.255.1', {timeout: 1500}, function(err) {
 ## Examples:
 
 ```js
-  var request = require('request')
+  const request = require('postman-request')
     , rand = Math.floor(Math.random()*100000000).toString()
     ;
   request(
@@ -1006,7 +1191,7 @@ while the response object is unmodified and will contain compressed data if
 the server sent a compressed response.
 
 ```js
-  var request = require('request')
+  const request = require('postman-request')
   request(
     { method: 'GET'
     , uri: 'http://www.google.com'
@@ -1034,7 +1219,7 @@ the server sent a compressed response.
 Cookies are disabled by default (else, they would be used in subsequent requests). To enable cookies, set `jar` to `true` (either in `defaults` or `options`).
 
 ```js
-var request = request.defaults({jar: true})
+const request = request.defaults({jar: true})
 request('http://www.google.com', function () {
   request('http://images.google.com')
 })
@@ -1043,8 +1228,8 @@ request('http://www.google.com', function () {
 To use a custom cookie jar (instead of `request`’s global cookie jar), set `jar` to an instance of `request.jar()` (either in `defaults` or `options`)
 
 ```js
-var j = request.jar()
-var request = request.defaults({jar:j})
+const j = request.jar()
+const request = request.defaults({jar:j})
 request('http://www.google.com', function () {
   request('http://images.google.com')
 })
@@ -1053,9 +1238,9 @@ request('http://www.google.com', function () {
 OR
 
 ```js
-var j = request.jar();
-var cookie = request.cookie('key1=value1');
-var url = 'http://www.google.com';
+const j = request.jar();
+const cookie = request.cookie('key1=value1');
+const url = 'http://www.google.com';
 j.setCookie(cookie, url);
 request({url: url, jar: j}, function () {
   request('http://images.google.com')
@@ -1068,9 +1253,9 @@ which supports saving to and restoring from JSON files), pass it as a parameter
 to `request.jar()`:
 
 ```js
-var FileCookieStore = require('tough-cookie-filestore');
+const FileCookieStore = require('tough-cookie-filestore');
 // NOTE - currently the 'cookies.json' file must already exist!
-var j = request.jar(new FileCookieStore('cookies.json'));
+const j = request.jar(new FileCookieStore('cookies.json'));
 request = request.defaults({ jar : j })
 request('http://www.google.com', function() {
   request('http://images.google.com')
@@ -1079,17 +1264,17 @@ request('http://www.google.com', function() {
 
 The cookie store must be a
 [`tough-cookie`](https://github.com/SalesforceEng/tough-cookie)
-store and it must support synchronous operations; see the
-[`CookieStore` API docs](https://github.com/SalesforceEng/tough-cookie#cookiestore-api)
+store and it must support asynchronous operations; see the
+[`CookieStore` API docs](https://github.com/SalesforceEng/tough-cookie#api)
 for details.
 
 To inspect your cookie jar after a request:
 
 ```js
-var j = request.jar()
+const j = request.jar()
 request({url: 'http://www.google.com', jar: j}, function () {
-  var cookie_string = j.getCookieString(url); // "key1=value1; key2=value2; ..."
-  var cookies = j.getCookies(url);
+  const cookie_string = j.getCookieStringSync(url); // "key1=value1; key2=value2; ..."
+  const cookies = j.getCookiesSync(url);
   // [{key: 'key1', value: 'value1', domain: "www.google.com", ...}, ...]
 })
 ```

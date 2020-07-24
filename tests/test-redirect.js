@@ -86,7 +86,7 @@ tape('setup', function (t) {
 })
 
 tape('permanent bounce', function (t) {
-  jar.setCookie('quux=baz', s.url)
+  jar.setCookieSync('quux=baz', s.url)
   hits = {}
   request({
     uri: s.url + '/perm',
@@ -103,7 +103,7 @@ tape('permanent bounce', function (t) {
 })
 
 tape('preserve HEAD method when using followAllRedirects', function (t) {
-  jar.setCookie('quux=baz', s.url)
+  jar.setCookieSync('quux=baz', s.url)
   hits = {}
   request({
     method: 'HEAD',
@@ -268,6 +268,69 @@ tape('should follow delete redirects when followallredirects true', function (t)
   })
 })
 
+// @note Previously all the methods get redirected with their request method
+// preserved(not changed to GET) other than the following 4:
+// PATCH, PUT, POST, DELETE (Probably accounted for only GET & HEAD).
+// BUT, with followAllRedirects set, the request method is changed to GET for
+// non GET & HEAD methods.
+//
+// Since: https://github.com/postmanlabs/postman-request/pull/31
+// non GET & HEAD methods get redirects with their method changed to GET unless
+// followOriginalHttpMethod is set.
+tape('should follow options redirects by default', function (t) {
+  hits = {}
+  request({
+    method: 'OPTIONS', // options because custom method is not supported by Node's HTTP server
+    uri: s.url + '/temp',
+    jar: jar,
+    headers: { cookie: 'foo=bar' }
+  }, function (err, res, body) {
+    t.equal(err, null)
+    t.equal(res.statusCode, 200)
+    t.ok(hits.temp, 'Original request is to /temp')
+    t.ok(hits.temp_landing, 'Forward to temporary landing URL')
+    t.equal(body, 'GET temp_landing', 'Got temporary landing content') // Previously redirected with OPTIONS
+    t.end()
+  })
+})
+
+tape('should follow options redirects when followallredirects true', function (t) {
+  hits = {}
+  request({
+    method: 'OPTIONS',
+    uri: s.url + '/temp',
+    followAllRedirects: true,
+    jar: jar,
+    headers: { cookie: 'foo=bar' }
+  }, function (err, res, body) {
+    t.equal(err, null)
+    t.equal(res.statusCode, 200)
+    t.ok(hits.temp, 'Original request is to /temp')
+    t.ok(hits.temp_landing, 'Forward to temporary landing URL')
+    t.equal(body, 'GET temp_landing', 'Got temporary landing content')
+    t.end()
+  })
+})
+
+tape('should follow options redirects when followallredirects true and followOriginalHttpMethod is enabled', function (t) {
+  hits = {}
+  request({
+    method: 'OPTIONS',
+    uri: s.url + '/temp',
+    followAllRedirects: true,
+    followOriginalHttpMethod: true,
+    jar: jar,
+    headers: { cookie: 'foo=bar' }
+  }, function (err, res, body) {
+    t.equal(err, null)
+    t.equal(res.statusCode, 200)
+    t.ok(hits.temp, 'Original request is to /temp')
+    t.ok(hits.temp_landing, 'Forward to temporary landing URL')
+    t.equal(body, 'OPTIONS temp_landing', 'Got temporary landing content')
+    t.end()
+  })
+})
+
 tape('should follow 307 delete redirects when followallredirects true', function (t) {
   hits = {}
   request.del(s.url + '/fwd', {
@@ -366,7 +429,7 @@ tape('should have referer header by default when following redirect', function (
     t.end()
   })
   .on('redirect', function () {
-    t.equal(this.headers.referer, s.url + '/temp')
+    t.equal(this.headers.Referer, s.url + '/temp')
   })
 })
 
@@ -383,7 +446,7 @@ tape('should not have referer header when removeRefererHeader is true', function
     t.end()
   })
   .on('redirect', function () {
-    t.equal(this.headers.referer, undefined)
+    t.equal(this.headers.Referer, undefined)
   })
 })
 

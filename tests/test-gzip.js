@@ -69,7 +69,7 @@ tape('setup', function (t) {
   var a = 48271
   var m = 0x7FFFFFFF
   var x = 1
-  testContentBig = new Buffer(10240)
+  testContentBig = Buffer.alloc(10240)
   for (var i = 0; i < testContentBig.length; ++i) {
     x = (a * x) & m
     // Printable ASCII range from 32-126, inclusive
@@ -139,6 +139,17 @@ tape('does not request gzip if user specifies Accepted-Encodings', function (t) 
     t.equal(err, null)
     t.equal(res.headers['content-encoding'], undefined)
     t.equal(body, testContent)
+    t.end()
+  })
+})
+
+tape('does not decode gzip encoding when "brotli" option is set', function (t) {
+  var headers = { 'Accept-Encoding': 'gzip' }
+  var options = { url: server.url + '/foo', headers: headers, brotli: true }
+  request.get(options, function (err, res, body) {
+    t.equal(err, null)
+    t.equal(res.headers['content-encoding'], 'gzip')
+    t.equal(body, testContentGzip.toString())
     t.end()
   })
 })
@@ -270,28 +281,23 @@ tape('do not try to pipe HEAD request responses', function (t) {
 tape('do not try to pipe responses with no body', function (t) {
   var options = { url: server.url + '/foo', gzip: true }
 
-  options.headers = {code: 105}
-  request.post(options, function (err, res, body) {
-    t.equal(err, null)
-    t.equal(res.headers.code, '105')
-    t.equal(body, '')
+  // skip 105 on Node >= v10
+  var statusCodes = process.version.split('.')[0].slice(1) >= 10
+    ? [204, 304] : [105, 204, 304]
 
-    options.headers = {code: 204}
+  ;(function next (index) {
+    if (index === statusCodes.length) {
+      t.end()
+      return
+    }
+    options.headers = {code: statusCodes[index]}
     request.post(options, function (err, res, body) {
       t.equal(err, null)
-      t.equal(res.headers.code, '204')
+      t.equal(res.headers.code, statusCodes[index].toString())
       t.equal(body, '')
-
-      options.headers = {code: 304}
-      request.post(options, function (err, res, body) {
-        t.equal(err, null)
-        t.equal(res.headers.code, '304')
-        t.equal(body, '')
-
-        t.end()
-      })
+      next(++index)
     })
-  })
+  })(0)
 })
 
 tape('cleanup', function (t) {

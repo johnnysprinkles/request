@@ -1,22 +1,23 @@
 'use strict'
 
+var tls = require('tls')
 var http = require('http')
 var https = require('https')
 var url = require('url')
 var util = require('util')
 var stream = require('stream')
 var zlib = require('zlib')
-var hawk = require('hawk')
 var aws2 = require('aws-sign2')
 var aws4 = require('aws4')
+var uuid = require('uuid/v4')
 var httpSignature = require('http-signature')
 var mime = require('mime-types')
-var stringstream = require('stringstream')
 var caseless = require('caseless')
 var ForeverAgent = require('forever-agent')
-var FormData = require('form-data')
+var FormData = require('@postman/form-data')
 var extend = require('extend')
 var isstream = require('isstream')
+var streamLength = require('stream-length')
 var isTypedArray = require('is-typedarray').strict
 var helpers = require('./lib/helpers')
 var cookies = require('./lib/cookies')
@@ -25,12 +26,15 @@ var Querystring = require('./lib/querystring').Querystring
 var Har = require('./lib/har').Har
 var Auth = require('./lib/auth').Auth
 var OAuth = require('./lib/oauth').OAuth
+var hawk = require('./lib/hawk')
 var Multipart = require('./lib/multipart').Multipart
 var Redirect = require('./lib/redirect').Redirect
 var Tunnel = require('./lib/tunnel').Tunnel
 var now = require('performance-now')
 var Buffer = require('safe-buffer').Buffer
-
+var inflate = require('./lib/inflate')
+var brotli = require('./lib/brotli')
+var urlParse = require('./lib/url-parse')
 var safeStringify = helpers.safeStringify
 var isReadStream = helpers.isReadStream
 var toBase64 = helpers.toBase64
@@ -70,6 +74,38 @@ function filterOutReservedFunctions (reserved, options) {
   return object
 }
 
+function transformFormData (formData) {
+  // Transform the object representation of form-data fields to array representation.
+  // This might not preserve the order of form fields defined in object representation.
+  // But, this transformation is required to support backward compatibility.
+  //
+  // Form-Data should be stored as an array to respect the fields order.
+  // RFC 7578#section-5.2  Ordered Fields and Duplicated Field Names
+  // https://tools.ietf.org/html/rfc7578#section-5.2
+
+  var transformedFormData = []
+  var appendFormParam = function (key, param) {
+    transformedFormData.push({
+      key: key,
+      value: param && param.hasOwnProperty('value') ? param.value : param,
+      options: param && param.hasOwnProperty('options') ? param.options : undefined
+    })
+  }
+  for (var formKey in formData) {
+    if (formData.hasOwnProperty(formKey)) {
+      var formValue = formData[formKey]
+      if (Array.isArray(formValue)) {
+        for (var j = 0; j < formValue.length; j++) {
+          appendFormParam(formKey, formValue[j])
+        }
+      } else {
+        appendFormParam(formKey, formValue)
+      }
+    }
+  }
+  return transformedFormData
+}
+
 // Return a simpler request object to allow serialization
 function requestToJSON () {
   var self = this
@@ -107,6 +143,24 @@ function Request (options) {
     options = self._har.options(options)
   }
 
+  // transform `formData` for backward compatibility
+  // don't check for explicit object type to support legacy shenanigans
+  if (options.formData && !Array.isArray(options.formData)) {
+    options.formData = transformFormData(options.formData)
+  }
+
+  // use custom URL parser if provided, fallback to url.parse and url.resolve
+  if (!(
+    options.urlParser &&
+    typeof options.urlParser.parse === 'function' &&
+    typeof options.urlParser.resolve === 'function'
+  )) {
+    options.urlParser = {
+      parse: url.parse,
+      resolve: url.resolve
+    }
+  }
+
   stream.Stream.call(self)
   var reserved = Object.keys(Request.prototype)
   var nonReserved = filterForNonReserved(reserved, options)
@@ -116,6 +170,7 @@ function Request (options) {
 
   self.readable = true
   self.writable = true
+  self._debug = []
   if (options.method) {
     self.explicitMethod = true
   }
@@ -132,11 +187,13 @@ util.inherits(Request, stream.Stream)
 
 // Debugging
 Request.debug = process.env.NODE_DEBUG && /\brequest\b/.test(process.env.NODE_DEBUG)
+
 function debug () {
   if (Request.debug) {
     console.error('REQUEST %s', util.format.apply(util, arguments))
   }
 }
+
 Request.prototype.debug = debug
 
 Request.prototype.init = function (options) {
@@ -148,6 +205,31 @@ Request.prototype.init = function (options) {
     options = {}
   }
   self.headers = self.headers ? copy(self.headers) : {}
+
+  // for this request (or redirect) store its debug logs in `_reqResInfo` and
+  // store its reference in `_debug` which holds debug logs of every request
+  self._reqResInfo = {}
+  self._debug.push(self._reqResInfo)
+
+  // additional postman feature starts
+  // bind default events sent via options
+  if (options.bindOn) {
+    Object.keys(options.bindOn).forEach(function (eventName) {
+      !Array.isArray(options.bindOn[eventName]) && (options.bindOn[eventName] = [options.bindOn[eventName]])
+      options.bindOn[eventName].forEach(function (listener) {
+        self.on(eventName, listener)
+      })
+    })
+  }
+  if (options.once) {
+    Object.keys(options.once).forEach(function (eventName) {
+      !Array.isArray(options.bindOnce[eventName]) && (options.bindOnce[eventName] = [options.bindOnce[eventName]])
+      options.bindOnce[eventName].forEach(function (listener) {
+        self.once(eventName, listener)
+      })
+    })
+  }
+  // additional postman feature ends
 
   // Delete headers with value undefined since they break
   // ClientRequest.OutgoingMessage.setHeader in node 0.12
@@ -178,12 +260,12 @@ Request.prototype.init = function (options) {
   // Protect against double callback
   if (!self._callback && self.callback) {
     self._callback = self.callback
-    self.callback = function () {
+    self.callback = function (error, response, body) {
       if (self._callbackCalled) {
         return // Print a warning maybe?
       }
       self._callbackCalled = true
-      self._callback.apply(self, arguments)
+      self._callback(error, response, body, self._debug)
     }
     self.on('error', self.callback.bind())
     self.on('complete', self.callback.bind(self, null))
@@ -234,7 +316,7 @@ Request.prototype.init = function (options) {
 
   // If a string URI/URL was given, parse it into a URL object
   if (typeof self.uri === 'string') {
-    self.uri = url.parse(self.uri)
+    self.uri = self.urlParser.parse(self.uri)
   }
 
   // Some URL objects are not from a URL parsed string and need href added
@@ -285,17 +367,19 @@ Request.prototype.init = function (options) {
 
   self._redirect.onRequest(options)
 
-  self.setHost = false
-  if (!self.hasHeader('host')) {
-    var hostHeaderName = self.originalHostHeaderName || 'host'
-    // When used with an IPv6 address, `host` will provide
-    // the correct bracketed format, unlike using `hostname` and
-    // optionally adding the `port` when necessary.
+  // Add `Host` header if not defined already
+  self.setHost = (self.setHost === undefined || Boolean(self.setHost))
+  if (!self.hasHeader('host') && self.setHost) {
+    var hostHeaderName = self.originalHostHeaderName || 'Host'
     self.setHeader(hostHeaderName, self.uri.host)
-    self.setHost = true
+    // Drop :port suffix from Host header if known protocol.
+    if (self.uri.port) {
+      if ((self.uri.port === '80' && self.uri.protocol === 'http:') ||
+          (self.uri.port === '443' && self.uri.protocol === 'https:')) {
+        self.setHeader(hostHeaderName, self.uri.hostname)
+      }
+    }
   }
-
-  self.jar(self._jar || options.jar)
 
   if (!self.uri.port) {
     if (self.uri.protocol === 'http:') { self.uri.port = 80 } else if (self.uri.protocol === 'https:') { self.uri.port = 443 }
@@ -316,23 +400,13 @@ Request.prototype.init = function (options) {
   if (options.formData) {
     var formData = options.formData
     var requestForm = self.form()
-    var appendFormValue = function (key, value) {
-      if (value && value.hasOwnProperty('value') && value.hasOwnProperty('options')) {
-        requestForm.append(key, value.value, value.options)
+    for (var i = 0, ii = formData.length; i < ii; i++) {
+      var formParam = formData[i]
+      if (!formParam) { continue }
+      if (formParam.options) {
+        requestForm.append(formParam.key, formParam.value, formParam.options)
       } else {
-        requestForm.append(key, value)
-      }
-    }
-    for (var formKey in formData) {
-      if (formData.hasOwnProperty(formKey)) {
-        var formValue = formData[formKey]
-        if (formValue instanceof Array) {
-          for (var j = 0; j < formValue.length; j++) {
-            appendFormValue(formKey, formValue[j])
-          }
-        } else {
-          appendFormValue(formKey, formValue)
-        }
+        requestForm.append(formParam.key, formParam.value)
       }
     }
   }
@@ -380,8 +454,17 @@ Request.prototype.init = function (options) {
     )
   }
 
-  if (self.gzip && !self.hasHeader('accept-encoding')) {
-    self.setHeader('accept-encoding', 'gzip, deflate')
+  if (!self.hasHeader('accept-encoding')) {
+    var acceptEncoding = ''
+
+    self.gzip && (acceptEncoding += 'gzip, deflate')
+
+    if (self.brotli) {
+      acceptEncoding && (acceptEncoding += ', ')
+      acceptEncoding += 'br'
+    }
+
+    acceptEncoding && self.setHeader('Accept-Encoding', acceptEncoding)
   }
 
   if (self.uri.auth && !self.hasHeader('authorization')) {
@@ -392,7 +475,7 @@ Request.prototype.init = function (options) {
   if (!self.tunnel && self.proxy && self.proxy.auth && !self.hasHeader('proxy-authorization')) {
     var proxyAuthPieces = self.proxy.auth.split(':').map(function (item) { return self._qs.unescape(item) })
     var authHeader = 'Basic ' + toBase64(proxyAuthPieces.join(':'))
-    self.setHeader('proxy-authorization', authHeader)
+    self.setHeader('Proxy-Authorization', authHeader)
   }
 
   if (self.proxy && !self.tunnel) {
@@ -406,11 +489,20 @@ Request.prototype.init = function (options) {
     self.multipart(options.multipart)
   }
 
-  if (options.time) {
+  // enable timings if verbose is true
+  if (options.time || options.verbose) {
     self.timing = true
 
     // NOTE: elapsedTime is deprecated in favor of .timings
     self.elapsedTime = self.elapsedTime || 0
+  }
+
+  if (options.verbose) {
+    self.verbose = true
+  }
+
+  if (typeof options.maxResponseSize === 'number') {
+    self.maxResponseSize = options.maxResponseSize
   }
 
   function setContentLength () {
@@ -429,12 +521,13 @@ Request.prototype.init = function (options) {
       }
 
       if (length) {
-        self.setHeader('content-length', length)
+        self.setHeader('Content-Length', length)
       } else {
         self.emit('error', new Error('Argument error, options.body.'))
       }
     }
   }
+
   if (self.body && !isstream(self.body)) {
     setContentLength()
   }
@@ -457,6 +550,19 @@ Request.prototype.init = function (options) {
 
   if (options.ca) {
     self.ca = options.ca
+  }
+
+  // prefer common self.agent if exists
+  if (self.agents && !self.agent) {
+    var agent = protocol === 'http:' ? self.agents.http : self.agents.https
+    if (agent) {
+      if (agent.agentClass || agent.agentOptions) {
+        options.agentClass = agent.agentClass || options.agentClass
+        options.agentOptions = agent.agentOptions || options.agentOptions
+      } else {
+        self.agent = agent
+      }
+    }
   }
 
   if (!self.agent) {
@@ -494,7 +600,8 @@ Request.prototype.init = function (options) {
     self.src = src
     if (isReadStream(src)) {
       if (!self.hasHeader('content-type')) {
-        self.setHeader('content-type', mime.lookup(src.path))
+        // @note fallback to 'application/octet-stream' if mime.lookup returns `false`
+        self.setHeader('Content-Type', mime.lookup(src.path) || 'application/octet-stream')
       }
     } else {
       if (src.headers) {
@@ -505,16 +612,16 @@ Request.prototype.init = function (options) {
         }
       }
       if (self._json && !self.hasHeader('content-type')) {
-        self.setHeader('content-type', 'application/json')
+        self.setHeader('Content-Type', 'application/json')
       }
       if (src.method && !self.explicitMethod) {
         self.method = src.method
       }
     }
 
-  // self.on('pipe', function () {
-  //   console.error('You have already piped to this stream. Pipeing twice is likely to break the request.')
-  // })
+    // self.on('pipe', function () {
+    //   console.error('You have already piped to this stream. Pipeing twice is likely to break the request.')
+    // })
   })
 
   defer(function () {
@@ -524,10 +631,14 @@ Request.prototype.init = function (options) {
 
     var end = function () {
       if (self._form) {
-        if (!self._auth.hasAuth) {
-          self._form.pipe(self)
-        } else if (self._auth.hasAuth && self._auth.sentAuth) {
-          self._form.pipe(self)
+        if (!self._auth.hasAuth || (self._auth.hasAuth && self._auth.sentAuth)) {
+          try {
+            self._form.pipe(self)
+          } catch (err) {
+            self.abort()
+            options.callback && options.callback(err)
+            return
+          }
         }
       }
       if (self._multipart && self._multipart.chunked) {
@@ -535,7 +646,16 @@ Request.prototype.init = function (options) {
       }
       if (self.body) {
         if (isstream(self.body)) {
-          self.body.pipe(self)
+          if (self.hasHeader('content-length')) {
+            self.body.pipe(self)
+          } else { // certain servers require content-length to function. we try to pre-detect if possible
+            streamLength(self.body, {}, function (err, len) {
+              if (!(err || self._started || self.hasHeader('content-length') || len === null || len < 0)) {
+                self.setHeader('Content-Length', len)
+              }
+              self.body.pipe(self)
+            })
+          }
         } else {
           setContentLength()
           if (Array.isArray(self.body)) {
@@ -551,29 +671,41 @@ Request.prototype.init = function (options) {
         console.warn('options.requestBodyStream is deprecated, please pass the request object to stream.pipe.')
         self.requestBodyStream.pipe(self)
       } else if (!self.src) {
-        if (self._auth.hasAuth && !self._auth.sentAuth) {
+        if ((self._auth.hasAuth && !self._auth.sentAuth) || self.hasHeader('content-length')) {
           self.end()
           return
         }
-        if (self.method !== 'GET' && typeof self.method !== 'undefined') {
-          self.setHeader('content-length', 0)
+        switch (self.method) {
+          case 'GET':
+          case 'HEAD':
+          case 'TRACE':
+          case 'DELETE':
+          case 'CONNECT':
+          case 'OPTIONS':
+          case undefined:
+            // @note this behavior is same as Node.js
+            break
+          default:
+            self.setHeader('Content-Length', 0)
+            break
         }
         self.end()
       }
     }
 
-    if (self._form && !self.hasHeader('content-length')) {
-      // Before ending the request, we had to compute the length of the whole form, asyncly
-      self.setHeader(self._form.getHeaders(), true)
-      self._form.getLength(function (err, length) {
-        if (!err && !isNaN(length)) {
-          self.setHeader('content-length', length)
-        }
+    self.jar(self._jar || options.jar, function () {
+      if (self._form && !self.hasHeader('content-length')) {
+        // Before ending the request, we had to compute the length of the whole form, asyncly
+        self._form.getLength(function (err, length) {
+          if (!err && !isNaN(length)) {
+            self.setHeader('Content-Length', length)
+          }
+          end()
+        })
+      } else {
         end()
-      })
-    } else {
-      end()
-    }
+      }
+    })
 
     self.ntick = true
   })
@@ -590,6 +722,9 @@ Request.prototype.getNewAgent = function () {
   }
   if (self.ca) {
     options.ca = self.ca
+  }
+  if (self.extraCA) {
+    options.extraCA = self.extraCA
   }
   if (self.ciphers) {
     options.ciphers = self.ciphers
@@ -627,7 +762,7 @@ Request.prototype.getNewAgent = function () {
   // ca option is only relevant if proxy or destination are https
   var proxy = self.proxy
   if (typeof proxy === 'string') {
-    proxy = url.parse(proxy)
+    proxy = self.urlParser.parse(proxy)
   }
   var isHttps = (proxy && proxy.protocol === 'https:') || this.uri.protocol === 'https:'
 
@@ -637,6 +772,14 @@ Request.prototype.getNewAgent = function () {
         poolKey += ':'
       }
       poolKey += options.ca
+    }
+
+    // only add when NodeExtraCACerts is enabled
+    if (tls.__createSecureContext && options.extraCA) {
+      if (poolKey) {
+        poolKey += ':'
+      }
+      poolKey += options.extraCA
     }
 
     if (typeof options.rejectUnauthorized !== 'undefined') {
@@ -658,6 +801,13 @@ Request.prototype.getNewAgent = function () {
         poolKey += ':'
       }
       poolKey += options.pfx.toString('ascii')
+    }
+
+    if (options.passphrase) {
+      if (poolKey) {
+        poolKey += ':'
+      }
+      poolKey += options.passphrase
     }
 
     if (options.ciphers) {
@@ -721,21 +871,38 @@ Request.prototype.start = function () {
     return
   }
 
+  // postman: emit start event
+  self.emit('start')
+
   self._started = true
   self.method = self.method || 'GET'
   self.href = self.uri.href
 
   if (self.src && self.src.stat && self.src.stat.size && !self.hasHeader('content-length')) {
-    self.setHeader('content-length', self.src.stat.size)
+    self.setHeader('Content-Length', self.src.stat.size)
   }
   if (self._aws) {
     self.aws(self._aws, true)
+  }
+
+  self._reqResInfo.request = {
+    method: self.method,
+    href: self.uri.href,
+    proxy: (self.proxy && { href: self.proxy.href }) || undefined,
+    httpVersion: '1.1'
   }
 
   // We have a method named auth, which is completely different from the http.request
   // auth option.  If we don't remove it, we're gonna have a bad time.
   var reqOptions = copy(self)
   delete reqOptions.auth
+
+  // Workaround for a bug in Node: https://github.com/nodejs/node/issues/8321
+  if (!(self.disableUrlEncoding || self.proxy || self.uri.isUnix)) {
+    try {
+      extend(reqOptions, urlParse(self.uri.href))
+    } catch (e) { } // nothing to do if urlParse fails, "extend" never throws an error.
+  }
 
   debug('make request', self.uri.href)
 
@@ -746,6 +913,19 @@ Request.prototype.start = function () {
 
   try {
     self.req = self.httpModule.request(reqOptions)
+
+    // Remove blacklisted headers from the request instance.
+    // @note don't check for `hasHeader` because headers like `connection`,
+    // 'content-length', 'transfer-encoding' etc. are added at the very end
+    // and `removeHeader` updates the Node.js internal state which makes sure
+    // these headers are not added.
+    if (Array.isArray(self.blacklistHeaders) && self.blacklistHeaders.length) {
+      self.blacklistHeaders.forEach(function (header) {
+        self.req.removeHeader(header)
+        // also remove from the `self` for the consistency
+        self.removeHeader(header)
+      })
+    }
   } catch (err) {
     self.emit('error', err)
     return
@@ -776,6 +956,26 @@ Request.prototype.start = function () {
   })
 
   self.req.on('socket', function (socket) {
+    if (self.verbose) {
+      // The reused socket holds all the session data which was injected in
+      // during the first connection. This is done because events like
+      // `lookup`, `connect` & `secureConnect` will not be triggered for a
+      // reused socket and debug information will be lost for that request.
+      var reusedSocket = Boolean(socket.__SESSION_ID && socket.__SESSION_DATA)
+
+      if (!reusedSocket) {
+        socket.__SESSION_ID = uuid()
+        socket.__SESSION_DATA = {}
+      }
+
+      // @note make sure you don't serialize this object to avoid memory leak
+      self._reqResInfo.session = {
+        id: socket.__SESSION_ID,
+        reused: reusedSocket,
+        data: socket.__SESSION_DATA
+      }
+    }
+
     // `._connecting` was the old property which was made public in node v6.1.0
     var isConnecting = socket._connecting || socket.connecting
     if (self.timing) {
@@ -788,10 +988,85 @@ Request.prototype.start = function () {
 
         var onConnectTiming = function () {
           self.timings.connect = now() - self.startTimeNow
+
+          if (self.verbose) {
+            socket.__SESSION_DATA.addresses = {
+              // local address
+              // @note there's no `socket.localFamily` but `.address` method
+              // returns same output as of remote.
+              local: (typeof socket.address === 'function') && socket.address(),
+
+              // remote address
+              remote: {
+                address: socket.remoteAddress,
+                family: socket.remoteFamily,
+                port: socket.remotePort
+              }
+            }
+          }
+        }
+
+        var onSecureConnectTiming = function () {
+          self.timings.secureConnect = now() - self.startTimeNow
+
+          if (self.verbose) {
+            socket.__SESSION_DATA.tls = {
+              // true if the session was reused
+              reused: (typeof socket.isSessionReused === 'function') && socket.isSessionReused(),
+
+              // true if the peer certificate was signed by one of the CAs specified
+              authorized: socket.authorized,
+
+              // reason why the peer's certificate was not been verified
+              authorizationError: socket.authorizationError,
+
+              // negotiated cipher name
+              cipher: (typeof socket.getCipher === 'function') && socket.getCipher(),
+
+              // negotiated SSL/TLS protocol version
+              // @note Node >= v5.7.0
+              protocol: (typeof socket.getProtocol === 'function') && socket.getProtocol(),
+
+              // type, name, and size of parameter of an ephemeral key exchange
+              // @note Node >= v5.0.0
+              ephemeralKeyInfo: (typeof socket.getEphemeralKeyInfo === 'function') && socket.getEphemeralKeyInfo()
+            }
+
+            // peer certificate information
+            // @note if session is reused, all certificate information is
+            // stripped from the socket (returns {}).
+            // Refer: https://github.com/nodejs/node/issues/3940
+            var peerCert = (typeof socket.getPeerCertificate === 'function') && (socket.getPeerCertificate() || {})
+
+            socket.__SESSION_DATA.tls.peerCertificate = {
+              subject: peerCert.subject && {
+                country: peerCert.subject.C,
+                stateOrProvince: peerCert.subject.ST,
+                locality: peerCert.subject.L,
+                organization: peerCert.subject.O,
+                organizationalUnit: peerCert.subject.OU,
+                commonName: peerCert.subject.CN,
+                alternativeNames: peerCert.subjectaltname
+              },
+              issuer: peerCert.issuer && {
+                country: peerCert.issuer.C,
+                stateOrProvince: peerCert.issuer.ST,
+                locality: peerCert.issuer.L,
+                organization: peerCert.issuer.O,
+                organizationalUnit: peerCert.issuer.OU,
+                commonName: peerCert.issuer.CN
+              },
+              validFrom: peerCert.valid_from && new Date(peerCert.valid_from),
+              validTo: peerCert.valid_to && new Date(peerCert.valid_to),
+              fingerprint: peerCert.fingerprint,
+              serialNumber: peerCert.serialNumber
+            }
+          }
         }
 
         socket.once('lookup', onLookupTiming)
         socket.once('connect', onConnectTiming)
+        socket.once('secureConnect', onSecureConnectTiming)
 
         // clean up timing event listeners if needed on error
         self.req.once('error', function () {
@@ -825,8 +1100,7 @@ Request.prototype.start = function () {
       if (isConnecting) {
         var onReqSockConnect = function () {
           socket.removeListener('connect', onReqSockConnect)
-          clearTimeout(self.timeoutTimer)
-          self.timeoutTimer = null
+          self.clearTimeout()
           setReqTimeout()
         }
 
@@ -866,15 +1140,12 @@ Request.prototype.onRequestError = function (error) {
   }
   if (self.req && self.req._reusedSocket && error.code === 'ECONNRESET' &&
     self.agent.addRequestNoreuse) {
-    self.agent = { addRequest: self.agent.addRequestNoreuse.bind(self.agent) }
+    self.agent = {addRequest: self.agent.addRequestNoreuse.bind(self.agent)}
     self.start()
     self.req.end()
     return
   }
-  if (self.timeout && self.timeoutTimer) {
-    clearTimeout(self.timeoutTimer)
-    self.timeoutTimer = null
-  }
+  self.clearTimeout()
   self.emit('error', error)
 }
 
@@ -890,6 +1161,7 @@ Request.prototype.onRequestResponse = function (response) {
     if (self.timing) {
       self.timings.end = now() - self.startTimeNow
       response.timingStart = self.startTime
+      response.timingStartTimer = self.startTimeNow
 
       // fill in the blanks for any periods that didn't trigger, such as
       // no lookup or connect due to keep alive
@@ -901,6 +1173,9 @@ Request.prototype.onRequestResponse = function (response) {
       }
       if (!self.timings.connect) {
         self.timings.connect = self.timings.lookup
+      }
+      if (!self.timings.secureConnect && self.httpModule === https) {
+        self.timings.secureConnect = self.timings.connect
       }
       if (!self.timings.response) {
         self.timings.response = self.timings.connect
@@ -926,7 +1201,14 @@ Request.prototype.onRequestResponse = function (response) {
         download: self.timings.end - self.timings.response,
         total: self.timings.end
       }
+
+      // if secureConnect is present, add secureHandshake and update firstByte
+      if (self.timings.secureConnect) {
+        response.timingPhases.secureHandshake = self.timings.secureConnect - self.timings.connect
+        response.timingPhases.firstByte = self.timings.response - self.timings.secureConnect
+      }
     }
+
     debug('response end', self.uri.href, response.statusCode, response.headers)
   })
 
@@ -936,6 +1218,17 @@ Request.prototype.onRequestResponse = function (response) {
     return
   }
 
+  self._reqResInfo.response = {
+    statusCode: response.statusCode,
+    httpVersion: response.httpVersion
+  }
+
+  if (self.timing) {
+    self._reqResInfo.timingStart = self.startTime
+    self._reqResInfo.timingStartTimer = self.startTimeNow
+    self._reqResInfo.timings = self.timings
+  }
+
   self.response = response
   response.request = self
   response.toJSON = responseToJSON
@@ -943,7 +1236,7 @@ Request.prototype.onRequestResponse = function (response) {
   // XXX This is different on 0.10, because SSL is strict by default
   if (self.httpModule === https &&
     self.strictSSL && (!response.hasOwnProperty('socket') ||
-    !response.socket.authorized)) {
+      !response.socket.authorized)) {
     debug('strict ssl error', self.uri.href)
     var sslErr = response.hasOwnProperty('socket') ? response.socket.authorizationError : self.uri.href + ' does not support SSL'
     self.emit('error', new Error('SSL Error: ' + sslErr))
@@ -961,38 +1254,16 @@ Request.prototype.onRequestResponse = function (response) {
   if (self.setHost) {
     self.removeHeader('host')
   }
-  if (self.timeout && self.timeoutTimer) {
-    clearTimeout(self.timeoutTimer)
-    self.timeoutTimer = null
-  }
+  self.clearTimeout()
 
-  var targetCookieJar = (self._jar && self._jar.setCookie) ? self._jar : globalCookieJar
-  var addCookie = function (cookie) {
-    // set the cookie if it's domain in the href's domain.
-    try {
-      targetCookieJar.setCookie(cookie, self.uri.href, {ignoreError: true})
-    } catch (e) {
-      self.emit('error', e)
+  function responseHandler () {
+    if (self._redirect.onResponse(response)) {
+      return // Ignore the rest of the response
     }
-  }
 
-  response.caseless = caseless(response.headers)
-
-  if (response.caseless.has('set-cookie') && (!self._disableCookies)) {
-    var headerName = response.caseless.has('set-cookie')
-    if (Array.isArray(response.headers[headerName])) {
-      response.headers[headerName].forEach(addCookie)
-    } else {
-      addCookie(response.headers[headerName])
-    }
-  }
-
-  if (self._redirect.onResponse(response)) {
-    return // Ignore the rest of the response
-  } else {
     // Be a good stream and emit end when the response is finished.
     // Hack to emit end on close because of a core bug that never fires end
-    response.on('close', function () {
+    response.once('close', function () {
       if (!self._ended) {
         self.response.emit('end')
       }
@@ -1015,7 +1286,7 @@ Request.prototype.onRequestResponse = function (response) {
     }
 
     var responseContent
-    if (self.gzip && !noBody(response.statusCode)) {
+    if ((self.gzip || self.brotli) && !noBody(response.statusCode)) {
       var contentEncoding = response.headers['content-encoding'] || 'identity'
       contentEncoding = contentEncoding.trim().toLowerCase()
 
@@ -1028,11 +1299,14 @@ Request.prototype.onRequestResponse = function (response) {
         finishFlush: zlib.Z_SYNC_FLUSH
       }
 
-      if (contentEncoding === 'gzip') {
+      if (self.gzip && contentEncoding === 'gzip') {
         responseContent = zlib.createGunzip(zlibOptions)
         response.pipe(responseContent)
-      } else if (contentEncoding === 'deflate') {
-        responseContent = zlib.createInflate(zlibOptions)
+      } else if (self.gzip && contentEncoding === 'deflate') {
+        responseContent = inflate.createInflate(zlibOptions)
+        response.pipe(responseContent)
+      } else if (self.brotli && contentEncoding === 'br') {
+        responseContent = brotli.createBrotliDecompress()
         response.pipe(responseContent)
       } else {
         // Since previous versions didn't check for Content-Encoding header,
@@ -1049,14 +1323,33 @@ Request.prototype.onRequestResponse = function (response) {
     if (self.encoding) {
       if (self.dests.length !== 0) {
         console.error('Ignoring encoding parameter as this stream is being piped to another stream which makes the encoding option invalid.')
-      } else if (responseContent.setEncoding) {
-        responseContent.setEncoding(self.encoding)
       } else {
-        // Should only occur on node pre-v0.9.4 (joyent/node@9b5abe5) with
-        // zlib streams.
-        // If/When support for 0.9.4 is dropped, this should be unnecessary.
-        responseContent = responseContent.pipe(stringstream(self.encoding))
+        responseContent.setEncoding(self.encoding)
       }
+    }
+
+    // Node by default returns the status message with `latin1` character encoding,
+    // which results in characters lying outside the range of `U+0000 to U+00FF` getting truncated
+    // so that they can be mapped in the given range.
+    // Refer: https://nodejs.org/docs/latest-v12.x/api/buffer.html#buffer_buffers_and_character_encodings
+    //
+    // Exposing `statusMessageEncoding` option to make encoding type configurable.
+    // This would help in correctly representing status messages belonging to range outside of `latin1`
+    //
+    // @note: The Regex `[^\w\s-']` is tested to prevent unnecessary computation of creating a Buffer and
+    // then decoding it when the status message consists of common characters,
+    // specifically belonging to the following set: [a-z, A-Z, 0-9, -, _ ', whitespace]
+    // As in that case, no matter what the encoding type is used for decoding the buffer, the result would remain the same.
+    //
+    // @note: Providing a value in this option will result in force re-encoding of the status message
+    // which may not always be intended by the server - specifically in cases where
+    // server returns a status message which when encoded again with a different character encoding
+    // results in some other characters.
+    // For example: If the server intentionally responds with `ð\x9F\x98\x8A` as status message
+    // but if the statusMessageEncoding option is set to `utf8`, then it would get converted to '😊'.
+    var statusMessage = String(responseContent.statusMessage)
+    if (self.statusMessageEncoding && /[^\w\s-']/.test(statusMessage)) {
+      responseContent.statusMessage = Buffer.from(statusMessage, 'latin1').toString(self.statusMessageEncoding)
     }
 
     if (self._paused) {
@@ -1071,12 +1364,31 @@ Request.prototype.onRequestResponse = function (response) {
       self.pipeDest(dest)
     })
 
+    var responseThresholdEnabled = false
+    var responseBytesLeft
+
+    if (typeof self.maxResponseSize === 'number') {
+      responseThresholdEnabled = true
+      responseBytesLeft = self.maxResponseSize
+    }
+
     responseContent.on('data', function (chunk) {
       if (self.timing && !self.responseStarted) {
         self.responseStartTime = (new Date()).getTime()
 
         // NOTE: responseStartTime is deprecated in favor of .timings
         response.responseStartTime = self.responseStartTime
+      }
+      // if response threshold is set, update the response bytes left to hit
+      // threshold. If exceeds, abort the request.
+      if (responseThresholdEnabled) {
+        responseBytesLeft -= chunk.length
+        if (responseBytesLeft < 0) {
+          self.emit('error', new Error('Maximum response size reached'))
+          self.destroy()
+          self.abort()
+          return
+        }
       }
       self._destdata = true
       self.emit('data', chunk)
@@ -1101,12 +1413,63 @@ Request.prototype.onRequestResponse = function (response) {
       })
     }
   }
+
+  function forEachAsync (items, fn, cb) {
+    !cb && (cb = function () { /* (ಠ_ಠ) */ })
+
+    if (!(Array.isArray(items) && fn)) { return cb() }
+
+    var index = 0
+    var totalItems = items.length
+    function next (err) {
+      if (err || index >= totalItems) {
+        return cb(err)
+      }
+
+      try {
+        fn.call(items, items[index++], next)
+      } catch (error) {
+        return cb(error)
+      }
+    }
+
+    if (!totalItems) { return cb() }
+
+    next()
+  }
+
+  var targetCookieJar = (self._jar && self._jar.setCookie) ? self._jar : globalCookieJar
+  var addCookie = function (cookie, cb) {
+    // set the cookie if it's domain in the URI's domain.
+    targetCookieJar.setCookie(cookie, self.uri, {ignoreError: true}, function () {
+      // swallow the error, don't fail the request because of cookie jar failure
+      cb()
+    })
+  }
+
+  response.caseless = caseless(response.headers)
+
+  if (response.caseless.has('set-cookie') && (!self._disableCookies)) {
+    var headerName = response.caseless.has('set-cookie')
+    if (Array.isArray(response.headers[headerName])) {
+      forEachAsync(response.headers[headerName], addCookie, function (err) {
+        if (err) { return self.emit('error', err) }
+
+        responseHandler()
+      })
+    } else {
+      addCookie(response.headers[headerName], responseHandler)
+    }
+  } else {
+    responseHandler()
+  }
+
   debug('finish init function', self.uri.href)
 }
 
 Request.prototype.readResponseBody = function (response) {
   var self = this
-  debug("reading response's body")
+  debug('reading response\'s body')
   var buffers = []
   var bufferLength = 0
   var strings = []
@@ -1174,6 +1537,7 @@ Request.prototype.abort = function () {
     self.response.destroy()
   }
 
+  self.clearTimeout()
   self.emit('abort')
 }
 
@@ -1234,7 +1598,7 @@ Request.prototype.qs = function (q, clobber) {
     return self
   }
 
-  self.uri = url.parse(self.uri.href.split('?')[0] + '?' + qs)
+  self.uri = self.urlParser.parse(self.uri.href.split('?')[0] + '?' + qs)
   self.url = self.uri
   self.path = self.uri.path
 
@@ -1246,22 +1610,33 @@ Request.prototype.qs = function (q, clobber) {
 }
 Request.prototype.form = function (form) {
   var self = this
+  var contentType = self.getHeader('content-type')
+  var overrideInvalidContentType = contentType ? !self.allowContentTypeOverride : true
   if (form) {
-    if (!/^application\/x-www-form-urlencoded\b/.test(self.getHeader('content-type'))) {
-      self.setHeader('content-type', 'application/x-www-form-urlencoded')
+    if (overrideInvalidContentType && !/^application\/x-www-form-urlencoded\b/.test(contentType)) {
+      self.setHeader('Content-Type', 'application/x-www-form-urlencoded')
     }
     self.body = (typeof form === 'string')
       ? self._qs.rfc3986(form.toString('utf8'))
       : self._qs.stringify(form).toString('utf8')
     return self
   }
+  // form-data
+  var contentTypeMatch = contentType && contentType.match &&
+    contentType.match(/^multipart\/form-data;.*boundary=(?:"([^"]+)"|([^;]+))/)
+  var boundary = contentTypeMatch && (contentTypeMatch[1] || contentTypeMatch[2])
   // create form-data object
-  self._form = new FormData()
+  // set custom boundary if present in content-type else auto-generate
+  self._form = new FormData({ _boundary: boundary })
   self._form.on('error', function (err) {
     err.message = 'form-data: ' + err.message
     self.emit('error', err)
     self.abort()
   })
+  if (overrideInvalidContentType && !contentTypeMatch) {
+    // overrides invalid or missing content-type
+    self.setHeader('Content-Type', 'multipart/form-data; boundary=' + self._form.getBoundary())
+  }
   return self._form
 }
 Request.prototype.multipart = function (multipart) {
@@ -1279,7 +1654,7 @@ Request.prototype.json = function (val) {
   var self = this
 
   if (!self.hasHeader('accept')) {
-    self.setHeader('accept', 'application/json')
+    self.setHeader('Accept', 'application/json')
   }
 
   if (typeof self.jsonReplacer === 'function') {
@@ -1295,13 +1670,13 @@ Request.prototype.json = function (val) {
         self.body = self._qs.rfc3986(self.body)
       }
       if (!self.hasHeader('content-type')) {
-        self.setHeader('content-type', 'application/json')
+        self.setHeader('Content-Type', 'application/json')
       }
     }
   } else {
     self.body = safeStringify(val, self._jsonReplacer)
     if (!self.hasHeader('content-type')) {
-      self.setHeader('content-type', 'application/json')
+      self.setHeader('Content-Type', 'application/json')
     }
   }
 
@@ -1364,25 +1739,26 @@ Request.prototype.aws = function (opts, now) {
       host: self.uri.host,
       path: self.uri.path,
       method: self.method,
-      headers: {
-        'content-type': self.getHeader('content-type') || ''
-      },
+      headers: self.headers,
       body: self.body
+    }
+    if (opts.service) {
+      options.service = opts.service
     }
     var signRes = aws4.sign(options, {
       accessKeyId: opts.key,
       secretAccessKey: opts.secret,
       sessionToken: opts.session
     })
-    self.setHeader('authorization', signRes.headers.Authorization)
-    self.setHeader('x-amz-date', signRes.headers['X-Amz-Date'])
+    self.setHeader('Authorization', signRes.headers.Authorization)
+    self.setHeader('X-Amz-Date', signRes.headers['X-Amz-Date'])
     if (signRes.headers['X-Amz-Security-Token']) {
-      self.setHeader('x-amz-security-token', signRes.headers['X-Amz-Security-Token'])
+      self.setHeader('X-Amz-Security-Token', signRes.headers['X-Amz-Security-Token'])
     }
   } else {
     // default: use aws-sign2
     var date = new Date()
-    self.setHeader('date', date.toUTCString())
+    self.setHeader('Date', date.toUTCString())
     var auth = {
       key: opts.key,
       secret: opts.secret,
@@ -1403,7 +1779,7 @@ Request.prototype.aws = function (opts, now) {
       auth.resource = '/'
     }
     auth.resource = aws2.canonicalizeResource(auth.resource)
-    self.setHeader('authorization', aws2.authorization(auth))
+    self.setHeader('Authorization', aws2.authorization(auth))
   }
 
   return self
@@ -1426,7 +1802,7 @@ Request.prototype.httpSignature = function (opts) {
 }
 Request.prototype.hawk = function (opts) {
   var self = this
-  self.setHeader('Authorization', hawk.client.header(self.uri, self.method, opts).header)
+  self.setHeader('Authorization', hawk.header(self.uri, self.method, opts))
 }
 Request.prototype.oauth = function (_oauth) {
   var self = this
@@ -1436,38 +1812,40 @@ Request.prototype.oauth = function (_oauth) {
   return self
 }
 
-Request.prototype.jar = function (jar) {
+Request.prototype.jar = function (jar, cb) {
   var self = this
-  var cookies
+  self._jar = jar
+
+  if (!jar) {
+    // disable cookies
+    self._disableCookies = true
+    return cb()
+  }
 
   if (self._redirect.redirectsFollowed === 0) {
     self.originalCookieHeader = self.getHeader('cookie')
   }
 
-  if (!jar) {
-    // disable cookies
-    cookies = false
-    self._disableCookies = true
-  } else {
-    var targetCookieJar = (jar && jar.getCookieString) ? jar : globalCookieJar
-    var urihref = self.uri.href
-    // fetch cookie in the Specified host
-    if (targetCookieJar) {
-      cookies = targetCookieJar.getCookieString(urihref)
-    }
-  }
+  var targetCookieJar = jar.getCookieString ? jar : globalCookieJar
+  // fetch cookie in the Specified host
+  targetCookieJar.getCookieString(self.uri, function (err, cookies) {
+    if (err) { return cb() }
 
-  // if need cookie and cookie is not empty
-  if (cookies && cookies.length) {
-    if (self.originalCookieHeader) {
-      // Don't overwrite existing Cookie header
-      self.setHeader('cookie', self.originalCookieHeader + '; ' + cookies)
-    } else {
-      self.setHeader('cookie', cookies)
+    // if need cookie and cookie is not empty
+    if (cookies && cookies.length) {
+      if (self.originalCookieHeader) {
+        if (Array.isArray(self.originalCookieHeader)) {
+          self.originalCookieHeader = self.originalCookieHeader.join('; ')
+        }
+        // Don't overwrite existing Cookie header
+        self.setHeader('Cookie', self.originalCookieHeader + '; ' + cookies)
+      } else {
+        self.setHeader('Cookie', cookies)
+      }
     }
-  }
-  self._jar = jar
-  return self
+
+    cb()
+  })
 }
 
 // Stream API
@@ -1533,10 +1911,18 @@ Request.prototype.resume = function () {
 }
 Request.prototype.destroy = function () {
   var self = this
+  this.clearTimeout()
   if (!self._ended) {
     self.end()
   } else if (self.response) {
     self.response.destroy()
+  }
+}
+
+Request.prototype.clearTimeout = function () {
+  if (this.timeoutTimer) {
+    clearTimeout(this.timeoutTimer)
+    this.timeoutTimer = null
   }
 }
 
